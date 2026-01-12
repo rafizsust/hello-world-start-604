@@ -1,0 +1,279 @@
+import { useState } from 'react';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { 
+  BookOpen, 
+  Headphones, 
+  PenTool,
+  Mic,
+  Clock, 
+  Target, 
+  AlertCircle,
+  Play,
+  Volume2
+} from 'lucide-react';
+import { cn } from '@/lib/utils';
+
+interface TestStartOverlayProps {
+  module: 'reading' | 'listening' | 'writing' | 'speaking';
+  testTitle?: string;
+  timeMinutes: number;
+  totalQuestions: number;
+  questionType: string;
+  difficulty: string;
+  wordLimit?: number;
+  onStart: () => void;
+  onCancel: () => void;
+}
+
+export function TestStartOverlay({
+  module,
+  testTitle,
+  timeMinutes,
+  totalQuestions,
+  questionType,
+  difficulty,
+  wordLimit,
+  onStart,
+  onCancel,
+}: TestStartOverlayProps) {
+  const [hasTestedAudio, setHasTestedAudio] = useState(module !== 'listening' && module !== 'speaking');
+  const [hasTestedMic, setHasTestedMic] = useState(module !== 'speaking');
+  const [skippedAudioTest, setSkippedAudioTest] = useState(false);
+  const [skippedMicTest, setSkippedMicTest] = useState(false);
+
+  const needsAudioTest = module === 'listening' || module === 'speaking';
+  const needsMicTest = module === 'speaking';
+  // Audio/microphone tests are recommended but optional. Start should always be available.
+  const isReady = true;
+
+  const testAudio = () => {
+    try {
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const oscillator = audioContext.createOscillator();
+      const gainNode = audioContext.createGain();
+      
+      oscillator.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+      
+      oscillator.frequency.value = 440;
+      oscillator.type = 'sine';
+      
+      gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+      gainNode.gain.linearRampToValueAtTime(0, audioContext.currentTime + 0.5);
+      
+      oscillator.start();
+      oscillator.stop(audioContext.currentTime + 0.5);
+      
+      setTimeout(() => {
+        audioContext.close();
+        setHasTestedAudio(true);
+      }, 600);
+    } catch (error) {
+      console.warn('Audio test failed:', error);
+      setHasTestedAudio(true); // Allow to proceed anyway
+    }
+  };
+
+  const testMicrophone = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach(track => track.stop());
+      setHasTestedMic(true);
+    } catch (error) {
+      console.warn('Microphone test failed:', error);
+      setHasTestedMic(true); // Allow to proceed but warn
+    }
+  };
+
+  const ModuleIcon = 
+    module === 'reading' ? BookOpen : 
+    module === 'listening' ? Headphones :
+    module === 'writing' ? PenTool : Mic;
+
+  const moduleLabel = 
+    module === 'reading' ? 'Reading' :
+    module === 'listening' ? 'Listening' :
+    module === 'writing' ? 'Writing' : 'Speaking';
+
+  const difficultyColor = 
+    difficulty === 'easy' ? 'bg-success/20 text-success border-success/30' :
+    difficulty === 'medium' ? 'bg-warning/20 text-warning border-warning/30' :
+    'bg-destructive/20 text-destructive border-destructive/30';
+
+  return (
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-background/95 backdrop-blur-sm animate-fade-in">
+      <Card className="max-w-lg w-full mx-4 shadow-2xl border-primary/20 max-h-[90vh] overflow-y-auto">
+        <CardHeader className="text-center pb-4">
+          <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-primary/10 flex items-center justify-center">
+            <ModuleIcon className="w-8 h-8 text-primary" />
+          </div>
+          <CardTitle className="text-2xl">
+            Ready to Start Your {moduleLabel} Test?
+          </CardTitle>
+          <CardDescription className="text-base">
+            {testTitle || 'AI-Generated Practice Test'}
+          </CardDescription>
+        </CardHeader>
+        
+        <CardContent className="space-y-6">
+          {/* Test Info */}
+          <div className={cn("grid gap-3", module === 'writing' ? "grid-cols-2" : "grid-cols-3")}>
+            <div className="text-center p-3 rounded-lg bg-muted/50">
+              <Clock className="w-5 h-5 mx-auto mb-1 text-muted-foreground" />
+              <div className="text-lg font-bold">{timeMinutes} min</div>
+              <div className="text-xs text-muted-foreground">Time Limit</div>
+            </div>
+            {module === 'writing' ? (
+              <div className="text-center p-3 rounded-lg bg-muted/50">
+                <Target className="w-5 h-5 mx-auto mb-1 text-muted-foreground" />
+                <div className="text-lg font-bold">{wordLimit || 250}+</div>
+                <div className="text-xs text-muted-foreground">Words Required</div>
+              </div>
+            ) : (
+              <>
+                <div className="text-center p-3 rounded-lg bg-muted/50">
+                  <Target className="w-5 h-5 mx-auto mb-1 text-muted-foreground" />
+                  <div className="text-lg font-bold">{totalQuestions}</div>
+                  <div className="text-xs text-muted-foreground">{module === 'speaking' ? 'Parts' : 'Questions'}</div>
+                </div>
+                <div className="text-center p-3 rounded-lg bg-muted/50">
+                  <Badge variant="outline" className={cn("text-xs", difficultyColor)}>
+                    {difficulty}
+                  </Badge>
+                  <div className="text-xs text-muted-foreground mt-1">Difficulty</div>
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="text-sm text-center text-muted-foreground">
+            {module === 'writing' ? (
+              <>Task Type: <span className="font-medium text-foreground">{questionType.replace(/_/g, ' ')}</span></>
+            ) : module === 'speaking' ? (
+              <>Test Format: <span className="font-medium text-foreground">{questionType.replace(/_/g, ' ')}</span></>
+            ) : (
+              <>Question Type: <span className="font-medium text-foreground">{questionType.replace(/_/g, ' ')}</span></>
+            )}
+          </div>
+
+          {/* Audio Test for Listening/Speaking */}
+          {needsAudioTest && (
+            <div className="p-4 rounded-lg bg-primary/5 border border-primary/20">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Volume2 className="w-5 h-5 text-primary" />
+                  <span className="text-sm font-medium">Test Your Audio {module === 'listening' ? '(Optional)' : ''}</span>
+                </div>
+                <div className="flex gap-2">
+                  {module === 'listening' && !hasTestedAudio && !skippedAudioTest && (
+                    <Button 
+                      size="sm" 
+                      variant="ghost"
+                      onClick={() => setSkippedAudioTest(true)}
+                    >
+                      Skip
+                    </Button>
+                  )}
+                  <Button 
+                    size="sm" 
+                    variant={hasTestedAudio ? "secondary" : "default"}
+                    onClick={testAudio}
+                  >
+                    {hasTestedAudio ? '✓ Audio Works' : 'Play Test Sound'}
+                  </Button>
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground mt-2">
+                {module === 'listening' 
+                  ? 'Recommended: Test your speakers or headphones before starting. You can skip this step if you prefer.'
+                  : 'Make sure your speakers or headphones are working before starting.'}
+              </p>
+            </div>
+          )}
+
+          {/* Microphone Test for Speaking */}
+          {needsMicTest && (
+            <div className="p-4 rounded-lg bg-primary/5 border border-primary/20">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Mic className="w-5 h-5 text-primary" />
+                  <span className="text-sm font-medium">Test Your Microphone (Optional)</span>
+                </div>
+                <div className="flex gap-2">
+                  {!hasTestedMic && !skippedMicTest && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => {
+                        setSkippedMicTest(true);
+                        setHasTestedMic(true);
+                      }}
+                    >
+                      Skip
+                    </Button>
+                  )}
+                  <Button
+                    size="sm"
+                    variant={hasTestedMic ? "secondary" : "default"}
+                    onClick={testMicrophone}
+                  >
+                    {hasTestedMic ? '✓ Mic Checked' : 'Test Microphone'}
+                  </Button>
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground mt-2">
+                Recommended: allow microphone permission now to avoid silent recordings.
+              </p>
+            </div>
+          )}
+
+          {/* Important Notice */}
+          <div className="p-4 rounded-lg bg-warning/5 border border-warning/20">
+            <div className="flex gap-3">
+              <AlertCircle className="w-5 h-5 text-warning shrink-0 mt-0.5" />
+              <div className="text-sm">
+                <p className="font-medium text-foreground mb-1">Before you begin:</p>
+                <ul className="text-muted-foreground space-y-1 list-disc list-inside">
+                  <li>Timer will start immediately when you click Start</li>
+                  {module !== 'speaking' && <li>You cannot pause the test once started</li>}
+                  <li>Make sure you're in a quiet environment</li>
+                  {module === 'listening' && (
+                    <li>Audio will play automatically - listen carefully</li>
+                  )}
+                  {module === 'writing' && (
+                    <li>Write at least {wordLimit || 250} words to submit</li>
+                  )}
+                  {module === 'speaking' && (
+                    <li>Speak clearly into your microphone when prompted</li>
+                  )}
+                </ul>
+              </div>
+            </div>
+          </div>
+
+
+          {/* Action Buttons */}
+          <div className="flex gap-3">
+            <Button 
+              variant="outline" 
+              className="flex-1"
+              onClick={onCancel}
+            >
+              Go Back
+            </Button>
+            <Button 
+              className="flex-1 gap-2"
+              onClick={onStart}
+              disabled={!isReady}
+            >
+              <Play className="w-4 h-4" />
+              Start Test
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}

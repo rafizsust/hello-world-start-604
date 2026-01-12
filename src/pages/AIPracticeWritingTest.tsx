@@ -1,0 +1,570 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
+import { Textarea } from '@/components/ui/textarea';
+import { Badge } from '@/components/ui/badge';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from '@/components/ui/resizable';
+import {
+  loadGeneratedTest,
+  loadGeneratedTestAsync,
+  savePracticeResult,
+  savePracticeResultAsync,
+  GeneratedTest,
+  PracticeResult,
+  GeneratedWritingSingleTask,
+  isWritingFullTest,
+} from '@/types/aiPractice';
+import { useToast } from '@/hooks/use-toast';
+import { useAuth } from '@/hooks/useAuth';
+import { useTopicCompletions } from '@/hooks/useTopicCompletions';
+import { supabase } from '@/integrations/supabase/client';
+import { describeApiError, ApiErrorDescriptor } from '@/lib/apiErrors';
+import { AILoadingScreen } from '@/components/common/AILoadingScreen';
+import { SubmissionErrorState } from '@/components/common/SubmissionErrorState';
+import { OfflineBanner } from '@/components/common/OfflineBanner';
+import { WritingTestControls } from '@/components/writing/WritingTestControls';
+import { TestStartOverlay } from '@/components/common/TestStartOverlay';
+import { ExitTestConfirmDialog } from '@/components/common/ExitTestConfirmDialog';
+import { IELTSVisualRenderer, IELTSChartData } from '@/components/common/IELTSVisualRenderer';
+import { Clock, Send, PenTool, ChevronLeft, ChevronRight, ArrowLeft } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { useIsMobile } from '@/hooks/use-mobile';
+type TestPhase = 'loading' | 'ready' | 'testing' | 'submitting' | 'submission_error' | 'done';
+
+export default function AIPracticeWritingTest() {
+  const { testId } = useParams<{ testId: string }>();
+  const navigate = useNavigate();
+  const { toast } = useToast();
+  const { user } = useAuth();
+  const { incrementCompletion } = useTopicCompletions('writing');
+  const isMobile = useIsMobile();
+  const [test, setTest] = useState<GeneratedTest | null>(null);
+  const [submissionText1, setSubmissionText1] = useState('');
+  const [submissionText2, setSubmissionText2] = useState('');
+  const [timeLeft, setTimeLeft] = useState(0);
+  const [isPaused, setIsPaused] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [testStarted, setTestStarted] = useState(false);
+  const [showStartOverlay, setShowStartOverlay] = useState(true);
+  const [showExitDialog, setShowExitDialog] = useState(false);
+  const [activeTask, setActiveTask] = useState<'task1' | 'task2'>('task1');
+  const [fontSize, setFontSize] = useState(16);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [phase, setPhase] = useState<TestPhase>('loading');
+  const [submissionError, setSubmissionError] = useState<ApiErrorDescriptor | null>(null);
+  const [isResubmitting, setIsResubmitting] = useState(false);
+  const startTimeRef = useRef<number>(Date.now());
+
+  // Determine if this is a full test
+  const writingTask = test?.writingTask;
+  const isFullTest = writingTask && isWritingFullTest(writingTask);
+  
+  // Get the current task(s)
+  const task1 = isFullTest ? writingTask.task1 : (!isFullTest && writingTask ? writingTask as GeneratedWritingSingleTask : null);
+  const task2 = isFullTest ? writingTask.task2 : null;
+
+  const wordCount1 = submissionText1.trim().split(/\s+/).filter(Boolean).length;
+  const wordCount2 = submissionText2.trim().split(/\s+/).filter(Boolean).length;
+
+  useEffect(() => {
+    if (!testId) {
+      navigate('/ai-practice');
+      return;
+    }
+
+    let cancelled = false;
+
+    const init = async () => {
+      const cached = loadGeneratedTest(testId);
+      const loadedTest = cached ?? (await loadGeneratedTestAsync(testId));
+      if (cancelled) return;
+
+      if (!loadedTest || !loadedTest.writingTask) {
+        toast({ title: 'Test Not Found', variant: 'destructive' });
+        navigate('/ai-practice');
+        return;
+      }
+
+      setTest(loadedTest);
+      setTimeLeft(loadedTest.timeMinutes * 60);
+      startTimeRef.current = Date.now();
+      setPhase('ready');
+    };
+
+    void init();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [testId, navigate, toast]);
+
+  useEffect(() => {
+    if (isPaused || !test || !testStarted) return;
+    const timer = setInterval(() => {
+      setTimeLeft(prev => {
+        if (prev <= 1) { clearInterval(timer); handleSubmit(); return 0; }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [isPaused, test, testStarted]);
+
+  const handleSubmit = async () => {
+    const totalWords = isFullTest ? wordCount1 + wordCount2 : wordCount1;
+    
+    if (totalWords < 50) {
+      toast({ title: 'Please write at least 50 words', variant: 'destructive' });
+      return;
+    }
+
+    setIsSubmitting(true);
+    setPhase('submitting');
+    const timeSpent = Math.floor((Date.now() - startTimeRef.current) / 1000);
+
+    try {
+      // Call evaluation function with correct parameter names matching edge function
+      const { data, error } = await supabase.functions.invoke('evaluate-ai-practice-writing', {
+        body: {
+          submissionText: isFullTest ? undefined : submissionText1,
+          // Full test parameters
+          isFullTest,
+          task1Text: isFullTest ? submissionText1 : undefined,
+          task2Text: isFullTest ? submissionText2 : undefined,
+          task1Instruction: isFullTest ? task1?.instruction : undefined,
+          task2Instruction: isFullTest ? task2?.instruction : undefined,
+          task1ImageBase64: isFullTest ? task1?.image_base64 : undefined,
+          task1VisualType: isFullTest ? task1?.visual_type : undefined,
+          // Single task parameters
+          taskType: isFullTest ? 'full_test' : task1?.task_type,
+          instruction: isFullTest ? undefined : task1?.instruction,
+          imageDescription: task1?.image_description,
+          imageBase64: isFullTest ? undefined : task1?.image_base64,
+          visualType: isFullTest ? undefined : task1?.visual_type,
+        },
+      });
+
+      if (error) throw error;
+      
+      // Check for edge function error in data
+      if (data?.error) {
+        const errorObj = new Error(data.error);
+        (errorObj as any).edgeFunctionData = data;
+        throw errorObj;
+      }
+
+      const result: PracticeResult = {
+        testId: test!.id,
+        answers: isFullTest ? { 1: submissionText1, 2: submissionText2 } : { 1: submissionText1 },
+        score: data?.overall_band || 0,
+        totalQuestions: isFullTest ? 2 : 1,
+        bandScore: data?.overall_band || 5,
+        completedAt: new Date().toISOString(),
+        timeSpent,
+        questionResults: [{
+          questionNumber: 1,
+          userAnswer: isFullTest ? `Task 1: ${submissionText1}\n\nTask 2: ${submissionText2}` : submissionText1,
+          correctAnswer: 'N/A',
+          isCorrect: true,
+          explanation: JSON.stringify(data?.evaluation_report || {}),
+        }],
+      };
+
+      savePracticeResult(result);
+      if (user) {
+        await savePracticeResultAsync(result, user.id, 'writing');
+      }
+      // Track topic completion
+      if (test?.topic) {
+        incrementCompletion(test.topic);
+      }
+      setPhase('done');
+      navigate(`/ai-practice/writing/results/${test!.id}`);
+    } catch (err: any) {
+      console.error('Evaluation error:', err);
+      const errDesc = describeApiError(err);
+      
+      // Store error and switch to error state (preserve text for resubmit)
+      setSubmissionError(errDesc);
+      setPhase('submission_error');
+      setIsSubmitting(false);
+      setIsResubmitting(false);
+      
+      toast({
+        title: errDesc.title,
+        description: 'Your writing is preserved. You can try again.',
+        variant: 'destructive',
+      });
+    }
+  };
+  
+  // Resubmit handler
+  const handleResubmit = async () => {
+    setIsResubmitting(true);
+    setSubmissionError(null);
+    await handleSubmit();
+  };
+
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  // Handle test start from overlay
+  const handleStartTest = useCallback(() => {
+    setShowStartOverlay(false);
+    setTestStarted(true);
+    startTimeRef.current = Date.now();
+  }, []);
+
+  const toggleFullscreen = () => {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen();
+      setIsFullscreen(true);
+    } else {
+      document.exitFullscreen();
+      setIsFullscreen(false);
+    }
+  };
+
+  const handleTimeChange = (minutes: number) => {
+    setTimeLeft(minutes * 60);
+  };
+
+  // Show submission error state
+  if (phase === 'submission_error' && submissionError) {
+    return (
+      <SubmissionErrorState
+        error={submissionError}
+        onResubmit={handleResubmit}
+        isResubmitting={isResubmitting}
+        testTopic={test?.topic}
+        module="writing"
+      />
+    );
+  }
+
+  if (isSubmitting) {
+    return <AILoadingScreen title="Evaluating Your Writing" description="AI is analyzing your response..." progressSteps={['Reading submission', 'Analyzing content', 'Scoring criteria', 'Generating feedback']} currentStepIndex={0} />;
+  }
+
+  if (!test?.writingTask) return <div className="min-h-screen flex items-center justify-center"><div className="animate-spin h-8 w-8 border-4 border-primary border-t-transparent rounded-full" /></div>;
+
+  // Show start overlay before test begins
+  if (showStartOverlay) {
+    const testTitle = isFullTest 
+      ? 'AI Practice: Full Writing Test (Task 1 + Task 2)'
+      : `AI Practice: ${task1?.task_type === 'task1' ? 'Task 1 (Report)' : 'Task 2 (Essay)'}`;
+    
+    return (
+      <TestStartOverlay
+        module="writing"
+        testTitle={testTitle}
+        timeMinutes={test.timeMinutes}
+        totalQuestions={isFullTest ? 2 : 1}
+        questionType={isFullTest ? 'FULL TEST' : (task1?.task_type === 'task1' ? 'TASK 1' : 'TASK 2')}
+        difficulty={test.difficulty}
+        wordLimit={isFullTest ? 400 : (task1?.word_limit_min || 150)}
+        onStart={handleStartTest}
+        onCancel={() => navigate('/ai-practice')}
+      />
+    );
+  }
+
+  // Format instruction text with IELTS-style formatting
+  const formatIELTSInstruction = (text: string, _taskType: 'task1' | 'task2') => {
+    // Split instruction into parts if it contains the word count requirement
+    const wordCountMatch = text.match(/Write at least (\d+) words\.?/i);
+    const mainInstruction = text.replace(/Write at least \d+ words\.?/i, '').trim();
+    
+    return (
+      <div className="space-y-4">
+        {/* Main instruction with proper formatting */}
+        <div 
+          className="leading-relaxed text-foreground" 
+          style={{ fontSize }}
+          dangerouslySetInnerHTML={{ 
+            __html: mainInstruction
+              // Bold key instruction phrases
+              .replace(/(Summarise the information)/gi, '<strong>$1</strong>')
+              .replace(/(selecting and reporting the main features)/gi, '<strong>$1</strong>')
+              .replace(/(make comparisons where relevant)/gi, '<strong>$1</strong>')
+              .replace(/(To what extent do you agree or disagree)/gi, '<strong>$1</strong>')
+              .replace(/(Discuss both views and give your own opinion)/gi, '<strong>$1</strong>')
+              .replace(/(What are the causes|What solutions can you suggest)/gi, '<strong>$1</strong>')
+              .replace(/(What are the advantages and disadvantages)/gi, '<strong>$1</strong>')
+              .replace(/(Give reasons for your answer)/gi, '<strong>$1</strong>')
+              .replace(/(include any relevant examples)/gi, '<strong>$1</strong>')
+              // Add line breaks for better readability
+              .replace(/\.\s+/g, '.</p><p class="mt-2">')
+          }} 
+        />
+        
+        {/* Word count requirement - styled as official IELTS */}
+        {wordCountMatch && (
+          <p className="text-sm font-medium text-foreground border-t pt-3 mt-4">
+            Write at least <strong>{wordCountMatch[1]}</strong> words.
+          </p>
+        )}
+      </div>
+    );
+  };
+
+  // Render single task UI with IELTS-style formatting and resizable panels
+  const renderSingleTask = (task: GeneratedWritingSingleTask, submission: string, setSubmission: (s: string) => void, wordCount: number) => {
+    // Mobile view: stacked layout
+    if (isMobile) {
+      return (
+        <div className="space-y-4">
+          <Card className="overflow-hidden">
+            <CardContent className="p-4 space-y-4">
+              {/* Task header with official styling */}
+              <div className="border-b pb-3">
+                <h2 className="text-lg font-bold uppercase tracking-wide text-foreground">
+                  WRITING {task.task_type === 'task1' ? 'TASK 1' : 'TASK 2'}
+                </h2>
+                <p className="text-xs text-muted-foreground mt-1">
+                  You should spend about {task.task_type === 'task1' ? '20' : '40'} minutes on this task.
+                </p>
+              </div>
+              
+              {/* Task 1: Show visual first (as in real IELTS). Always render a diagram container so failure shows a professional placeholder. */}
+              {task.task_type === 'task1' && (
+                <div className="flex justify-center py-4 border rounded-lg bg-muted/20">
+                  {task.chartData ? (
+                    <IELTSVisualRenderer
+                      chartData={task.chartData as IELTSChartData}
+                      fallbackDescription={task.image_description}
+                      maxWidth={400}
+                      maxHeight={250}
+                    />
+                  ) : (
+                    <IELTSVisualRenderer
+                      chartData={null}
+                      fallbackDescription={task.image_description || 'Task 1 diagram could not be generated.'}
+                      maxWidth={400}
+                      maxHeight={250}
+                    />
+                  )}
+                </div>
+              )}
+              
+              {/* Instruction with IELTS formatting */}
+              {formatIELTSInstruction(task.instruction, task.task_type as 'task1' | 'task2')}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardContent className="p-4 flex flex-col">
+              <div className="flex items-center justify-between mb-3 pb-2 border-b">
+                <Badge variant="secondary" className="text-sm px-3 py-1">
+                  Words: {wordCount}
+                </Badge>
+                {wordCount >= task.word_limit_min && (
+                  <Badge variant="default" className="bg-success text-success-foreground text-xs">
+                    ✓ Min {task.word_limit_min}
+                  </Badge>
+                )}
+              </div>
+              <Textarea 
+                value={submission} 
+                onChange={(e) => setSubmission(e.target.value)} 
+                placeholder="Start writing your response here..." 
+                className="min-h-[300px] resize-none font-serif leading-relaxed"
+                style={{ fontSize }}
+              />
+            </CardContent>
+          </Card>
+        </div>
+      );
+    }
+
+    // Desktop view: resizable side-by-side panels
+    return (
+      <ResizablePanelGroup 
+        direction="horizontal" 
+        className="min-h-[calc(100vh-180px)] rounded-lg border"
+      >
+        <ResizablePanel defaultSize={50} minSize={30}>
+          <div className="h-full overflow-auto p-6 space-y-4 bg-card">
+            {/* Task header with official styling */}
+            <div className="border-b pb-3">
+              <h2 className="text-xl font-bold uppercase tracking-wide text-foreground">
+                WRITING {task.task_type === 'task1' ? 'TASK 1' : 'TASK 2'}
+              </h2>
+              <p className="text-sm text-muted-foreground mt-1">
+                You should spend about {task.task_type === 'task1' ? '20' : '40'} minutes on this task.
+              </p>
+            </div>
+            
+            {/* Task 1: Show visual first (as in real IELTS). Always render a diagram container so failure shows a professional placeholder. */}
+            {task.task_type === 'task1' && (
+              <div className="flex justify-center py-4 border rounded-lg bg-muted/20">
+                {task.chartData ? (
+                  <IELTSVisualRenderer
+                    chartData={task.chartData as IELTSChartData}
+                    fallbackDescription={task.image_description}
+                    maxWidth={500}
+                    maxHeight={350}
+                  />
+                ) : (
+                  <IELTSVisualRenderer
+                    chartData={null}
+                    fallbackDescription={task.image_description || 'Task 1 diagram could not be generated.'}
+                    maxWidth={500}
+                    maxHeight={350}
+                  />
+                )}
+              </div>
+            )}
+            
+            {/* Instruction with IELTS formatting */}
+            {formatIELTSInstruction(task.instruction, task.task_type as 'task1' | 'task2')}
+          </div>
+        </ResizablePanel>
+
+        <ResizableHandle withHandle />
+
+        <ResizablePanel defaultSize={50} minSize={30}>
+          <div className="h-full flex flex-col p-6 bg-card">
+            <div className="flex items-center justify-between mb-3 pb-2 border-b">
+              <Badge variant="secondary" className="text-sm px-3 py-1">
+                Word Count: {wordCount}
+              </Badge>
+              {wordCount >= task.word_limit_min && (
+                <Badge variant="default" className="bg-success text-success-foreground">
+                  ✓ Minimum {task.word_limit_min} words met
+                </Badge>
+              )}
+            </div>
+            <Textarea 
+              value={submission} 
+              onChange={(e) => setSubmission(e.target.value)} 
+              placeholder="Start writing your response here..." 
+              className="flex-1 min-h-[400px] resize-none font-serif leading-relaxed"
+              style={{ fontSize }}
+            />
+          </div>
+        </ResizablePanel>
+      </ResizablePanelGroup>
+    );
+  };
+
+  return (
+    <div className="min-h-screen bg-background flex flex-col">
+      {/* Offline Banner */}
+      <OfflineBanner hasPendingAnswers={submissionText1.length > 0 || submissionText2.length > 0} />
+      <header className="sticky top-0 z-50 bg-background border-b border-border px-4 py-3">
+        <div className="container max-w-6xl mx-auto flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              onClick={() => setShowExitDialog(true)}
+              title="Exit Test"
+            >
+              <ArrowLeft className="w-5 h-5" />
+            </Button>
+            <ExitTestConfirmDialog
+              open={showExitDialog}
+              onOpenChange={setShowExitDialog}
+              onConfirm={() => navigate('/ai-practice')}
+              testType="Writing Test"
+            />
+            <PenTool className="w-5 h-5 text-primary" />
+            <div>
+              <h1 className="font-semibold text-sm md:text-base">
+                {isFullTest ? 'Full Writing Test' : (task1?.task_type === 'task1' ? 'Writing Task 1' : 'Writing Task 2')}
+              </h1>
+              <p className="text-xs text-muted-foreground">
+                {isFullTest ? '400+ words total' : `${task1?.word_limit_min}+ words required`}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            {isFullTest && (
+              <Badge variant="outline">
+                T1: {wordCount1} | T2: {wordCount2}
+              </Badge>
+            )}
+            <Badge variant="secondary">Words: {isFullTest ? wordCount1 + wordCount2 : wordCount1}</Badge>
+            <button 
+              onClick={() => setIsPaused(!isPaused)} 
+              className={cn(
+                "flex items-center gap-2 px-3 py-1.5 rounded-lg font-mono font-bold",
+                isPaused ? "bg-warning/20 text-warning" : timeLeft < 300 ? "bg-destructive/10 text-destructive" : "bg-muted"
+              )}
+            >
+              <Clock className="w-4 h-4" />{formatTime(timeLeft)}
+            </button>
+            <WritingTestControls
+              fontSize={fontSize}
+              setFontSize={setFontSize}
+              isFullscreen={isFullscreen}
+              toggleFullscreen={toggleFullscreen}
+              isPaused={isPaused}
+              togglePause={() => setIsPaused(!isPaused)}
+              customTime={Math.ceil(timeLeft / 60)}
+              setCustomTime={() => {}}
+              onTimeChange={handleTimeChange}
+            />
+            <Button onClick={handleSubmit} className="gap-2"><Send className="w-4 h-4" /><span className="hidden sm:inline">Submit</span></Button>
+          </div>
+        </div>
+      </header>
+
+      <div className="flex-1 container max-w-6xl mx-auto px-4 py-6">
+        {isFullTest && task1 && task2 ? (
+          <div className="space-y-4">
+            <Tabs value={activeTask} onValueChange={(v) => setActiveTask(v as 'task1' | 'task2')}>
+              <TabsList className="grid w-full max-w-md mx-auto grid-cols-2">
+                <TabsTrigger value="task1" className="flex items-center gap-2">
+                  Task 1
+                  {wordCount1 >= (task1.word_limit_min || 150) && <Badge variant="secondary" className="bg-success text-success-foreground text-xs">✓</Badge>}
+                </TabsTrigger>
+                <TabsTrigger value="task2" className="flex items-center gap-2">
+                  Task 2
+                  {wordCount2 >= (task2.word_limit_min || 250) && <Badge variant="secondary" className="bg-success text-success-foreground text-xs">✓</Badge>}
+                </TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="task1" className="mt-4">
+                {renderSingleTask(task1, submissionText1, setSubmissionText1, wordCount1)}
+              </TabsContent>
+
+              <TabsContent value="task2" className="mt-4">
+                {renderSingleTask(task2, submissionText2, setSubmissionText2, wordCount2)}
+              </TabsContent>
+            </Tabs>
+
+            {/* Quick navigation */}
+            <div className="flex justify-center gap-4">
+              <Button 
+                variant="outline" 
+                size="sm"
+                onClick={() => setActiveTask('task1')}
+                disabled={activeTask === 'task1'}
+              >
+                <ChevronLeft className="w-4 h-4 mr-1" />
+                Task 1
+              </Button>
+              <Button 
+                variant="outline" 
+                size="sm"
+                onClick={() => setActiveTask('task2')}
+                disabled={activeTask === 'task2'}
+              >
+                Task 2
+                <ChevronRight className="w-4 h-4 ml-1" />
+              </Button>
+            </div>
+          </div>
+        ) : task1 ? (
+          renderSingleTask(task1, submissionText1, setSubmissionText1, wordCount1)
+        ) : null}
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,1339 @@
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import { toast } from 'sonner';
+import {
+  ListeningQuestions,
+  ListeningNavigation,
+  ListeningTimer,
+} from '@/components/listening';
+import { TestOptionsMenu, ContrastMode, TextSizeMode } from '@/components/reading/TestOptionsMenu';
+import { TestStartOverlay } from '@/components/common/TestStartOverlay';
+import { ExitTestConfirmDialog } from '@/components/common/ExitTestConfirmDialog';
+import { SubmissionErrorState } from '@/components/common/SubmissionErrorState';
+import { OfflineBanner } from '@/components/common/OfflineBanner';
+import { StickyNote, ArrowLeft, ArrowRight, Sparkles, Volume2, Play, Pause, WifiOff } from 'lucide-react';
+import { SimulatedAudioPlayer } from '@/components/listening/SimulatedAudioPlayer';
+import {
+  ResizablePanel,
+  ResizablePanelGroup,
+} from "@/components/ui/resizable";
+import { cn } from '@/lib/utils';
+
+import { HighlightNoteProvider } from '@/hooks/useHighlightNotes';
+import { NoteSidebar } from '@/components/common/NoteSidebar';
+import { SubmitConfirmDialog } from '@/components/common/SubmitConfirmDialog';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Progress } from '@/components/ui/progress';
+import { useAuth } from '@/hooks/useAuth';
+import { useTopicCompletions } from '@/hooks/useTopicCompletions';
+import { useNetworkStatus } from '@/hooks/useNetworkStatus';
+import { useAudioPreloader } from '@/hooks/useAudioPreloader';
+import { describeApiError, ApiErrorDescriptor } from '@/lib/apiErrors';
+import { 
+  calculateBandScoreFromPercentage,
+  processMCMAGroup,
+  saveFailedSubmission,
+  clearFailedSubmission,
+  withRetry,
+  isRetryableError,
+  showRetryToast,
+  dismissRetryToast,
+} from '@/hooks/useTestSubmission';
+
+import { 
+  loadGeneratedTest,
+  loadGeneratedTestAsync,
+  savePracticeResultAsync,
+  GeneratedTest,
+  PracticeResult,
+  QuestionResult 
+} from '@/types/aiPractice';
+
+// Helper to render rich text
+const renderRichText = (text: string): string => {
+  if (!text) return '';
+  return text
+    .replace(/^### (.+)$/gm, '<h3 class="text-lg font-semibold mt-2 mb-1">$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2 class="text-xl font-bold mt-3 mb-2">$1</h2>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/^• (.+)$/gm, '<li class="ml-4 list-disc">$1</li>')
+    .replace(/^\d+\. (.+)$/gm, '<li class="ml-4 list-decimal">$1</li>')
+    .replace(/\n/g, '<br/>');
+};
+
+// Convert PCM to WAV
+function pcmToWav(pcmData: Uint8Array, sampleRate: number): Blob {
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const wavHeaderSize = 44;
+  const wavBuffer = new ArrayBuffer(wavHeaderSize + pcmData.length);
+  const view = new DataView(wavBuffer);
+
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + pcmData.length, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeString(36, 'data');
+  view.setUint32(40, pcmData.length, true);
+
+  const wavBytes = new Uint8Array(wavBuffer);
+  wavBytes.set(pcmData, wavHeaderSize);
+
+  return new Blob([wavBytes], { type: 'audio/wav' });
+}
+
+// Interfaces matching ListeningQuestions component
+interface Question {
+  id: string;
+  question_number: number;
+  question_type: string;
+  question_text: string;
+  correct_answer: string;
+  instruction: string | null;
+  group_id: string;
+  is_given: boolean;
+  heading: string | null;
+  options?: string[] | null;
+  option_format?: string | null;
+  table_data?: any; // For TABLE_COMPLETION type
+}
+
+interface QuestionGroup {
+  id: string;
+  question_type: string;
+  instruction: string | null;
+  start_question: number;
+  end_question: number;
+  options: any;
+  option_format?: string;
+  questions: Question[];
+}
+
+export default function AIPracticeListeningTest() {
+  const { testId } = useParams<{ testId: string }>();
+  const navigate = useNavigate();
+  const { user } = useAuth();
+  const { incrementCompletion } = useTopicCompletions('listening');
+  
+  const [test, setTest] = useState<GeneratedTest | null>(null);
+  const [questions, setQuestions] = useState<Question[]>([]);
+  const [questionGroups, setQuestionGroups] = useState<QuestionGroup[]>([]);
+  const [answers, setAnswers] = useState<Record<number, string>>({});
+  const [currentQuestion, setCurrentQuestion] = useState(1);
+  const [activePartIndex, setActivePartIndex] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [timeLeft, setTimeLeft] = useState(0);
+  const [isPaused, setIsPaused] = useState(false);
+  const [testStarted, setTestStarted] = useState(false);
+  const [showStartOverlay, setShowStartOverlay] = useState(true);
+  const [showExitDialog, setShowExitDialog] = useState(false);
+  const [showSubmitDialog, setShowSubmitDialog] = useState(false);
+  const [isNoteSidebarOpen, setIsNoteSidebarOpen] = useState(false);
+  const [mobileView, setMobileView] = useState<'questions' | 'audio'>('questions');
+  const [flaggedQuestions] = useState<Set<number>>(new Set());
+  
+  // Audio state
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [audioProgress, setAudioProgress] = useState(0);
+  const [audioReady, setAudioReady] = useState(false);
+  const [audioError, setAudioError] = useState<string | null>(null);
+  const [_audioSource, setAudioSource] = useState<'r2' | 'tts' | null>(null); // Track audio source for debugging
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const playbackSpeedRef = useRef(1);
+  const [audioEnded, setAudioEnded] = useState(false);
+  const [reviewTimeLeft, setReviewTimeLeft] = useState(30);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioUrlRef = useRef<string | null>(null);
+  const audioInitSeqRef = useRef(0);
+  const retryTimeoutRef = useRef<number | null>(null);
+  const isMountedRef = useRef(true);
+  
+  // Network status and audio preloader for offline resilience
+  const { isOnline, onNetworkRestored } = useNetworkStatus();
+  const { preloadAudio } = useAudioPreloader();
+  const [usingDeviceAudio, setUsingDeviceAudio] = useState(false);
+  
+  // Submission error state
+  const [submissionError, setSubmissionError] = useState<ApiErrorDescriptor | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // When TTS fallback is triggered, set the device audio flag
+  useEffect(() => {
+    if (audioError === 'tts_fallback') {
+      setUsingDeviceAudio(true);
+    }
+  }, [audioError]);
+
+  // Retry audio preload when network is restored
+  useEffect(() => {
+    const unsubscribe = onNetworkRestored(() => {
+      if (test?.audioUrl) {
+        console.log('[AIPracticeListening] Network restored - retrying audio preload...');
+        toast.success("Network restored. Reloading audio...", { duration: 2000 });
+        preloadAudio(test.audioUrl);
+        setUsingDeviceAudio(false);
+      }
+    });
+    return unsubscribe;
+  }, [test?.audioUrl, onNetworkRestored, preloadAudio]);
+
+  // Preload audio when test loads
+  useEffect(() => {
+    const audioUrl = test?.audioUrl || (test as any)?.audio_url;
+    if (audioUrl) {
+      console.log('[AIPracticeListening] Preloading audio...');
+      preloadAudio(audioUrl);
+    }
+  }, [test?.audioUrl, (test as any)?.audio_url, preloadAudio]);
+  
+  
+  // Theme settings
+  const [contrastMode, setContrastMode] = useState<ContrastMode>('black-on-white');
+  const [textSizeMode, setTextSizeMode] = useState<TextSizeMode>('regular');
+  
+  const startTimeRef = useRef<number>(Date.now());
+
+  // Keep latest playback speed available to retry logic without re-running effects
+  useEffect(() => {
+    playbackSpeedRef.current = playbackSpeed;
+  }, [playbackSpeed]);
+
+  // Calculate part ranges based on actual questions
+  const partRanges = useMemo(() => {
+    if (questions.length === 0) {
+      return [{ label: 'Part 1', start: 1, end: 10 }];
+    }
+    
+    const maxQ = Math.max(...questions.map(q => q.question_number));
+    
+    // For AI practice, we use a single "Part 1" containing all questions
+    return [{ label: 'Part 1', start: 1, end: maxQ }];
+  }, [questions]);
+
+  // Helper to initialize state from test data
+  const initializeTest = useCallback(function init(loadedTest: GeneratedTest) {
+    // Mark component as mounted for async retries
+    isMountedRef.current = true;
+
+    // Reset audio state for fresh initialization (also used by retry/hydration)
+    audioInitSeqRef.current += 1;
+    const initSeq = audioInitSeqRef.current;
+
+    if (retryTimeoutRef.current) {
+      window.clearTimeout(retryTimeoutRef.current);
+      retryTimeoutRef.current = null;
+    }
+
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+
+    if (audioUrlRef.current) {
+      URL.revokeObjectURL(audioUrlRef.current);
+      audioUrlRef.current = null;
+    }
+
+    setIsPlaying(false);
+    setAudioProgress(0);
+    setAudioReady(false);
+    setAudioEnded(false);
+    setAudioError(null);
+
+    setTest(loadedTest);
+    setTimeLeft(loadedTest.timeMinutes * 60);
+    startTimeRef.current = Date.now();
+
+    // Setup audio if available - PRIORITY: base64 > audio_url (root) > audioUrl > payload.audio_url > transcript TTS
+    // Check EVERY possible location including payload for preset tests
+    const resolvedAudioUrl =
+      loadedTest.audioUrl ||
+      (loadedTest as any).audio_url ||
+      (loadedTest as any).payload?.audio_url ||
+      (loadedTest as any).payload?.audioUrl ||
+      null;
+
+    const isPreset = Boolean((loadedTest as any).isPreset || (loadedTest as any).presetId || (loadedTest as any).payload?.presetId);
+
+    console.log('[AIPracticeListening] Audio resolution check:', {
+      audioUrl: loadedTest.audioUrl,
+      audio_url: (loadedTest as any).audio_url,
+      payloadAudioUrl: (loadedTest as any).payload?.audio_url,
+      resolved: resolvedAudioUrl,
+      isPreset,
+    });
+
+    const setupR2AudioWithRetry = (url: string) => {
+      const MAX_ATTEMPTS = 3;
+      const BASE_DELAY_MS = 350;
+      const speedAtInit = playbackSpeedRef.current;
+      
+      // URL normalization helpers (prefer .mp3, fallback to .wav)
+      const normalizeToMp3 = (u: string) => u.endsWith('.wav') ? u.replace(/\.wav$/, '.mp3') : u;
+      const getAlternativeUrl = (u: string) => {
+        if (u.endsWith('.mp3')) return u.replace(/\.mp3$/, '.wav');
+        if (u.endsWith('.wav')) return u.replace(/\.wav$/, '.mp3');
+        return null;
+      };
+      
+      // Normalize to .mp3 first (preferred format after compression)
+      const primaryUrl = normalizeToMp3(url);
+      const fallbackUrl = getAlternativeUrl(primaryUrl);
+
+      const attemptLoad = (currentUrl: string, attempt: number, isFallback: boolean) => {
+        // Abort if component was unmounted or a newer init started
+        if (!isMountedRef.current || audioInitSeqRef.current !== initSeq) return;
+
+        // Clear any old audio element
+        if (audioRef.current) {
+          audioRef.current.pause();
+          audioRef.current = null;
+        }
+
+        console.log(`[AIPracticeListening] Loading R2 audio (attempt ${attempt}, fallback: ${isFallback}):`, currentUrl);
+
+        const audio = new Audio(currentUrl);
+        audio.preload = 'auto';
+        audio.crossOrigin = 'anonymous';
+        audio.playbackRate = speedAtInit;
+        audioRef.current = audio;
+
+        audio.addEventListener(
+          'canplaythrough',
+          () => {
+            if (!isMountedRef.current || audioInitSeqRef.current !== initSeq) return;
+            console.log('[AIPracticeListening] R2 audio ready:', currentUrl);
+            setAudioReady(true);
+            setAudioSource('r2');
+          },
+          { once: true }
+        );
+
+        audio.addEventListener('timeupdate', () => {
+          if (!isMountedRef.current || audioInitSeqRef.current !== initSeq) return;
+          setAudioProgress((audio.currentTime / audio.duration) * 100 || 0);
+        });
+
+        audio.addEventListener('ended', () => {
+          if (!isMountedRef.current || audioInitSeqRef.current !== initSeq) return;
+          setIsPlaying(false);
+          setAudioEnded(true);
+        });
+
+        audio.addEventListener(
+          'error',
+          (e) => {
+            if (!isMountedRef.current || audioInitSeqRef.current !== initSeq) return;
+            console.warn(`[AIPracticeListening] R2 audio load error (attempt ${attempt}, fallback: ${isFallback})`, e);
+
+            // Retry a few times before trying fallback format
+            if (attempt < MAX_ATTEMPTS) {
+              const delay = BASE_DELAY_MS * attempt;
+              retryTimeoutRef.current = window.setTimeout(() => attemptLoad(currentUrl, attempt + 1, isFallback), delay);
+              return;
+            }
+
+            // If primary URL failed and we have a fallback (.wav), try it
+            if (!isFallback && fallbackUrl) {
+              console.log('[AIPracticeListening] Primary format (.mp3) failed, trying fallback (.wav):', fallbackUrl);
+              attemptLoad(fallbackUrl, 1, true);
+              return;
+            }
+
+            console.warn('[AIPracticeListening] R2 audio failed after all retries; falling back to TTS');
+            if (loadedTest.transcript) {
+              setAudioError('tts_fallback');
+              setAudioSource('tts');
+            } else {
+              setAudioError('Failed to load audio');
+            }
+          },
+          { once: true }
+        );
+
+        // Kick off preload
+        try {
+          audio.load();
+        } catch {
+          // ignore
+        }
+      };
+
+      attemptLoad(primaryUrl, 1, false);
+    };
+
+    if (loadedTest.audioBase64) {
+      try {
+        console.log('[AIPracticeListening] Using base64 audio from memory');
+        const pcmBytes = Uint8Array.from(atob(loadedTest.audioBase64), (c) => c.charCodeAt(0));
+        const wavBlob = pcmToWav(pcmBytes, loadedTest.sampleRate || 24000);
+        const url = URL.createObjectURL(wavBlob);
+        audioUrlRef.current = url;
+
+        const audio = new Audio(url);
+        audioRef.current = audio;
+
+        audio.playbackRate = playbackSpeed;
+        audio.addEventListener('canplaythrough', () => {
+          if (!isMountedRef.current || audioInitSeqRef.current !== initSeq) return;
+          setAudioReady(true);
+          setAudioSource('r2');
+        });
+        audio.addEventListener('timeupdate', () => {
+          if (!isMountedRef.current || audioInitSeqRef.current !== initSeq) return;
+          setAudioProgress((audio.currentTime / audio.duration) * 100 || 0);
+        });
+        audio.addEventListener('ended', () => {
+          if (!isMountedRef.current || audioInitSeqRef.current !== initSeq) return;
+          setIsPlaying(false);
+          setAudioEnded(true);
+        });
+        audio.addEventListener('error', () => {
+          if (!isMountedRef.current || audioInitSeqRef.current !== initSeq) return;
+          console.warn('[AIPracticeListening] Base64 audio failed, falling back to TTS');
+          if (loadedTest.transcript) {
+            setAudioError('tts_fallback');
+            setAudioSource('tts');
+          } else {
+            setAudioError('Failed to load audio');
+          }
+        });
+      } catch (err) {
+        console.error('[AIPracticeListening] Base64 conversion failed:', err);
+        if (loadedTest.transcript) {
+          setAudioError('tts_fallback');
+          setAudioSource('tts');
+        } else {
+          setAudioError('Audio generation failed.');
+        }
+      }
+    } else if (resolvedAudioUrl) {
+      console.log('[AIPracticeListening] Using R2 audio URL:', resolvedAudioUrl);
+      setupR2AudioWithRetry(resolvedAudioUrl);
+    } else if (loadedTest.transcript) {
+      // If this is a preset run, the DB may populate audio_url shortly after insert.
+      // Do NOT immediately fall back to TTS; poll briefly first.
+      if (isPreset && loadedTest.id) {
+        console.log('[AIPracticeListening] Preset audio URL missing; waiting briefly before TTS fallback');
+
+        const MAX_POLLS = 6;
+        const poll = async (attempt: number) => {
+          if (!isMountedRef.current || audioInitSeqRef.current !== initSeq) return;
+
+          const refreshed = await loadGeneratedTestAsync(loadedTest.id);
+          const refreshedUrl =
+            refreshed?.audioUrl ||
+            (refreshed as any)?.audio_url ||
+            (refreshed as any)?.payload?.audio_url ||
+            (refreshed as any)?.payload?.audioUrl ||
+            null;
+
+          if (refreshed && refreshedUrl) {
+            console.log('[AIPracticeListening] Preset audio URL became available');
+            init(refreshed);
+            return;
+          }
+
+          if (attempt >= MAX_POLLS) {
+            console.warn('[AIPracticeListening] Preset audio URL still missing; falling back to TTS');
+            setAudioError('tts_fallback');
+            setAudioSource('tts');
+            return;
+          }
+
+          const delay = 300 * attempt;
+          retryTimeoutRef.current = window.setTimeout(() => void poll(attempt + 1), delay);
+        };
+
+        void poll(1);
+        // Important: stop here; we’ll either re-init with audio or fall back later.
+        return;
+      }
+
+      // No audio available but transcript exists - use TTS simulation
+      console.log('[AIPracticeListening] No audio URL, using TTS fallback');
+      setAudioError('tts_fallback');
+      setAudioSource('tts');
+    } else {
+      // No audio and no transcript - critical error
+      console.error('[AIPracticeListening] No audio or transcript available');
+      setAudioError('Audio content not available.');
+    }
+
+    // Convert AI questions to expected format
+    if (loadedTest.questionGroups && loadedTest.questionGroups.length > 0) {
+      // Normalize question type - DO NOT use fallback, invalid types should be rejected upstream
+      const normalizeType = (raw: unknown) => {
+        const t = String(raw ?? '').trim();
+        if (!t) {
+          console.error('Missing question_type in AI payload - test is malformed');
+          return null; // Return null to indicate invalid
+        }
+        const upper = t.toUpperCase();
+        // Listening renderer expects MULTIPLE_CHOICE_SINGLE / MULTIPLE_CHOICE_MULTIPLE
+        if (upper === 'MULTIPLE_CHOICE') return 'MULTIPLE_CHOICE_SINGLE';
+        // Some imports may store short/slug forms
+        if (upper === 'DRAG_AND_DROP') return 'DRAG_AND_DROP_OPTIONS';
+        // British spelling / legacy naming
+        if (upper === 'MAP_LABELLING') return 'MAP_LABELING';
+        if (upper === 'SUMMARY_WORD_BANK') return 'SUMMARY_COMPLETION';
+        return upper;
+      };
+
+      const convertedQuestions: Question[] = [];
+      const convertedGroups: QuestionGroup[] = [];
+
+      loadedTest.questionGroups.forEach((group) => {
+        const groupType = normalizeType(group.question_type);
+
+        // Skip groups with invalid/missing question_type
+        if (!groupType) {
+          console.error('Skipping question group with missing question_type:', group.id);
+          return;
+        }
+
+        let groupOptions: any = group.options;
+        // Align with ListeningQuestions expectations (group.options.options + option_format)
+        if (
+          Array.isArray(groupOptions) &&
+          [
+            'MATCHING_CORRECT_LETTER',
+            'MAPS',
+            'MAP_LABELING',
+            'MULTIPLE_CHOICE_MULTIPLE',
+            'DRAG_AND_DROP_OPTIONS',
+            'FLOWCHART_COMPLETION',
+            'TABLE_COMPLETION',
+          ].includes(groupType)
+        ) {
+          groupOptions = { type: groupType, options: groupOptions, option_format: 'A' };
+        }
+
+        // For TABLE_COMPLETION, ensure table_data is preserved in group options
+        // Check multiple locations: group.options.table_data, group.table_data, or root payload table_data
+        if (groupType === 'TABLE_COMPLETION') {
+          const tableData = group.options?.table_data || 
+                           (group as any).table_data || 
+                           (loadedTest as any).table_data ||
+                           (loadedTest as any).payload?.table_data;
+          if (tableData) {
+            groupOptions = { ...groupOptions, table_data: tableData };
+          }
+        }
+
+        const groupQuestions: Question[] = group.questions.map((q) => {
+          // Use question-level type if it exists, otherwise fall back to group type
+          // Most AI payloads only have question_type at the group level, not on individual questions
+          const qt = (q.question_type ? normalizeType(q.question_type) : null) || groupType;
+          
+          // For TABLE_COMPLETION, also include table_data on the question if available
+          // Check all possible locations for table_data
+          const questionTableData = (q as any).table_data || 
+                                   group.options?.table_data || 
+                                   (group as any).table_data ||
+                                   (loadedTest as any).table_data ||
+                                   (loadedTest as any).payload?.table_data;
+          
+          return {
+            id: q.id,
+            question_number: q.question_number,
+            question_type: qt,
+            question_text: q.question_text,
+            correct_answer: q.correct_answer,
+            instruction: null,
+            group_id: group.id,
+            is_given: false,
+            heading: q.heading || null,
+            options: Array.isArray((q as any).options)
+              ? ((q as any).options as string[])
+              : Array.isArray((q as any).options?.options)
+                ? ((q as any).options.options as string[])
+                : null,
+            option_format: (q as any).option_format || groupOptions?.option_format || null,
+            // Include table_data for TABLE_COMPLETION questions
+            ...(qt === 'TABLE_COMPLETION' && questionTableData ? { table_data: questionTableData } : {}),
+          };
+        });
+
+        convertedQuestions.push(...groupQuestions);
+
+        convertedGroups.push({
+          id: group.id,
+          question_type: groupType,
+          instruction: group.instruction,
+          start_question: group.start_question,
+          end_question: group.end_question,
+          options: groupOptions,
+          option_format: groupOptions?.option_format,
+          questions: groupQuestions,
+        });
+      });
+
+      setQuestions(convertedQuestions.sort((a, b) => a.question_number - b.question_number));
+      setQuestionGroups(convertedGroups);
+
+      if (convertedQuestions.length > 0) {
+        setCurrentQuestion(convertedQuestions[0].question_number);
+      }
+    }
+
+    setLoading(false);
+  }, [playbackSpeed]);
+
+  // Load AI-generated test: first from memory cache, else from Supabase
+  useEffect(() => {
+    if (!testId) {
+      navigate('/ai-practice');
+      return;
+    }
+
+    // Try memory cache first
+    const cachedTest = loadGeneratedTest(testId);
+    if (cachedTest && cachedTest.module === 'listening') {
+      const hasPlayableAudio = Boolean(
+        cachedTest.audioBase64 ||
+          cachedTest.audioUrl ||
+          (cachedTest as any).audio_url ||
+          (cachedTest as any).payload?.audio_url ||
+          (cachedTest as any).payload?.audioUrl
+      );
+
+      // If cache is missing audio (common after backfills), hydrate from Supabase instead of forcing TTS.
+      if (hasPlayableAudio) {
+        initializeTest(cachedTest);
+        return;
+      }
+    }
+
+    // Fallback: load from Supabase
+    loadGeneratedTestAsync(testId).then((t) => {
+      if (!t || t.module !== 'listening') {
+        toast.error('Listening test not found');
+        navigate('/ai-practice');
+        return;
+      }
+      initializeTest(t);
+    });
+
+    return () => {
+      isMountedRef.current = false;
+      audioInitSeqRef.current += 1; // invalidate any in-flight audio handlers
+
+      if (retryTimeoutRef.current) {
+        window.clearTimeout(retryTimeoutRef.current);
+        retryTimeoutRef.current = null;
+      }
+
+      if (audioUrlRef.current) {
+        URL.revokeObjectURL(audioUrlRef.current);
+        audioUrlRef.current = null;
+      }
+
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current = null;
+      }
+    };
+  }, [testId, navigate, initializeTest]);
+
+  const handleAnswerChange = (questionNumber: number, answer: string) => {
+    setAnswers(prev => ({ ...prev, [questionNumber]: answer }));
+  };
+
+  const togglePlayPause = () => {
+    if (!audioRef.current) return;
+    if (isPlaying) {
+      audioRef.current.pause();
+    } else {
+      audioRef.current.play();
+    }
+    setIsPlaying(!isPlaying);
+  };
+
+  // Pause audio when test is paused
+  useEffect(() => {
+    if (isPaused && audioRef.current && isPlaying) {
+      audioRef.current.pause();
+      setIsPlaying(false);
+    }
+  }, [isPaused]);
+
+  const handleSpeedChange = (speed: number) => {
+    setPlaybackSpeed(speed);
+    if (audioRef.current) {
+      audioRef.current.playbackRate = speed;
+    }
+  };
+
+  const handleSubmit = async () => {
+    if (!test) return;
+
+    // Stop audio playback on submission
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+    }
+    setIsPlaying(false);
+
+    setIsSubmitting(true);
+    setSubmissionError(null);
+
+    const timeSpent = Math.floor((Date.now() - startTimeRef.current) / 1000);
+
+    // Save answers to localStorage BEFORE attempting submission (for recovery on failure)
+    saveFailedSubmission({
+      testId: test.id,
+      testType: 'ai-listening',
+      answers,
+      testTopic: test.topic,
+      timeSpent,
+    });
+
+    try {
+      console.log("Submitting listening test...");
+
+      // Build question results with MCMA group handling using shared utility
+      const questionResults: QuestionResult[] = [];
+      const processedQuestionNumbers = new Set<number>();
+      let correctCount = 0;
+      
+      // Process MCMA groups first (one result per group with partial scoring)
+      for (const group of questionGroups) {
+        if (group.question_type === 'MULTIPLE_CHOICE_MULTIPLE') {
+          for (let n = group.start_question; n <= group.end_question; n++) {
+            processedQuestionNumbers.add(n);
+          }
+          
+          // User's answer is stored on start_question only
+          const userAnswerRaw = answers[group.start_question]?.trim() || '';
+          
+          // Get correct answers from the original test payload
+          const firstQFromTest = test.questionGroups?.flatMap(g => g.questions).find(
+            (oq) => oq.question_number === group.start_question
+          );
+          const correctAnswerRaw = firstQFromTest?.correct_answer || '';
+          
+          // Get explanation from original test data
+          const originalQ = test.questionGroups?.flatMap(g => g.questions).find(
+            oq => oq.question_number === group.start_question
+          );
+          
+          // Use shared utility for MCMA processing
+          const mcmaResult = processMCMAGroup(
+            group.start_question,
+            group.end_question,
+            userAnswerRaw,
+            correctAnswerRaw,
+            originalQ?.explanation || ''
+          );
+          
+          // Add partial score to total
+          correctCount += mcmaResult.partialScore;
+          
+          questionResults.push(mcmaResult);
+        }
+      }
+      
+      // Process remaining questions (non-MCMA)
+      for (const q of questions) {
+        if (processedQuestionNumbers.has(q.question_number)) continue;
+        
+        const userAnswer = answers[q.question_number]?.trim() || '';
+        const correctAnswer = q.correct_answer;
+        const normUser = userAnswer.toLowerCase();
+        const normCorrect = String(correctAnswer).trim().toLowerCase();
+        const isCorrect = normUser === normCorrect || 
+          normCorrect.split(';').map(a => a.trim().toLowerCase()).includes(normUser);
+        
+        if (isCorrect) correctCount++;
+        
+        const originalQ = test.questionGroups?.flatMap(g => g.questions).find(
+          oq => oq.question_number === q.question_number
+        );
+        
+        questionResults.push({
+          questionNumber: q.question_number,
+          userAnswer,
+          correctAnswer,
+          isCorrect,
+          explanation: originalQ?.explanation || '',
+          questionType: q.question_type,
+        });
+      }
+
+      // Sort by question number
+      questionResults.sort((a, b) => a.questionNumber - b.questionNumber);
+
+      // Calculate total questions (MCMA counts as maxScore, others as 1)
+      let totalQuestions = 0;
+      for (const qr of questionResults) {
+        totalQuestions += qr.maxScore || 1;
+      }
+
+      // Use percentage-based band score for AI practice (official raw score tables don't apply to 7-question tests)
+      const percentage = totalQuestions > 0 ? Math.round((correctCount / totalQuestions) * 100) : 0;
+      const bandScore = calculateBandScoreFromPercentage(percentage);
+
+      const result: PracticeResult = {
+        testId: test.id,
+        answers,
+        score: correctCount,
+        totalQuestions,
+        bandScore,
+        completedAt: new Date().toISOString(),
+        timeSpent,
+        questionResults,
+      };
+
+      // Save result to Supabase with retry for network errors
+      if (user) {
+        let retryToastId: string | undefined;
+        
+        await withRetry(
+          async () => {
+            await savePracticeResultAsync(result, user.id, 'listening');
+          },
+          {
+            maxRetries: 3,
+            onRetry: (attempt) => {
+              retryToastId = showRetryToast(attempt, 3);
+            },
+          }
+        );
+        
+        // Dismiss retry toast on success
+        if (retryToastId) {
+          dismissRetryToast(retryToastId);
+          toast.success('Submission successful!');
+        }
+        
+        // Track topic completion
+        if (test.topic) {
+          incrementCompletion(test.topic);
+        }
+      }
+
+      // Clear failed submission on success
+      clearFailedSubmission();
+
+      // Navigate to Results Page
+      navigate(`/ai-practice/results/${test.id}`);
+
+    } catch (error) {
+      console.error("Submission failed", error);
+      const errorDescriptor = describeApiError(error);
+      setSubmissionError(errorDescriptor);
+      
+      // Show different message for retryable vs non-retryable errors
+      if (isRetryableError(error)) {
+        toast.error('Network error', { 
+          description: 'Could not connect after multiple attempts. Your answers are saved - please try again.' 
+        });
+      } else {
+        toast.error(errorDescriptor.title, { 
+          description: 'Your answers are preserved. You can try again.' 
+        });
+      }
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // Resubmit handler
+  const handleResubmit = async () => {
+    setSubmissionError(null);
+    await handleSubmit();
+  };
+
+  const getThemeClasses = () => {
+    const contrastClass = {
+      'black-on-white': 'ielts-theme-black-on-white',
+      'white-on-black': 'ielts-theme-white-on-black',
+      'yellow-on-black': 'ielts-theme-yellow-on-black',
+    }[contrastMode];
+    
+    const textSizeClass = {
+      'regular': 'ielts-text-regular',
+      'large': 'ielts-text-large',
+      'extra-large': 'ielts-text-extra-large',
+    }[textSizeMode];
+    
+    return `${contrastClass} ${textSizeClass}`;
+  };
+
+  const submitStats = useMemo(() => {
+    // Calculate total based on question groups (MCMA counted as its range, others as 1)
+    let totalCount = 0;
+    let answeredCount = 0;
+    const processedQuestions = new Set<number>();
+
+    for (const group of questionGroups) {
+      if (group.question_type === 'MULTIPLE_CHOICE_MULTIPLE') {
+        const maxAnswers = group.options?.max_answers || (group.end_question - group.start_question + 1);
+        totalCount += maxAnswers;
+
+        // Answer stored on start_question as comma-separated
+        const answer = answers[group.start_question] || '';
+        const selectedCount = answer ? answer.split(',').filter(Boolean).length : 0;
+        answeredCount += selectedCount;
+
+        // Mark all question numbers in range as processed
+        for (let n = group.start_question; n <= group.end_question; n++) {
+          processedQuestions.add(n);
+        }
+      }
+    }
+
+    // Count non-MCMA questions
+    for (const q of questions) {
+      if (processedQuestions.has(q.question_number)) continue;
+      totalCount += 1;
+      if (answers[q.question_number]?.trim().length > 0) {
+        answeredCount += 1;
+      }
+    }
+
+    return { totalCount, answeredCount };
+  }, [answers, questions, questionGroups]);
+
+  const currentPart = partRanges[activePartIndex];
+
+  // Apply theme classes to body
+  useEffect(() => {
+    const themeClasses = ['ielts-theme-black-on-white', 'ielts-theme-white-on-black', 'ielts-theme-yellow-on-black'];
+    const textClasses = ['ielts-text-regular', 'ielts-text-large', 'ielts-text-extra-large'];
+    
+    document.body.classList.remove(...themeClasses, ...textClasses);
+    
+    const currentTheme = {
+      'black-on-white': 'ielts-theme-black-on-white',
+      'white-on-black': 'ielts-theme-white-on-black',
+      'yellow-on-black': 'ielts-theme-yellow-on-black',
+    }[contrastMode];
+    
+    const currentTextSize = {
+      'regular': 'ielts-text-regular',
+      'large': 'ielts-text-large',
+      'extra-large': 'ielts-text-extra-large',
+    }[textSizeMode];
+    
+    document.body.classList.add(currentTheme, currentTextSize);
+    
+    return () => {
+      document.body.classList.remove(...themeClasses, ...textClasses);
+    };
+  }, [contrastMode, textSizeMode]);
+
+  // 30-second review countdown after audio ends
+  useEffect(() => {
+    if (!audioEnded || !testStarted) return;
+    
+    if (reviewTimeLeft <= 0) {
+      handleSubmit();
+      return;
+    }
+
+    const timer = setInterval(() => {
+      setReviewTimeLeft(prev => prev - 1);
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [audioEnded, reviewTimeLeft, testStarted]);
+
+  // Handle test start from overlay
+  const handleStartTest = useCallback(() => {
+    setShowStartOverlay(false);
+    setTestStarted(true);
+    startTimeRef.current = Date.now();
+  }, []);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-secondary flex items-center justify-center">
+        <div className="animate-pulse text-muted-foreground">Loading test...</div>
+      </div>
+    );
+  }
+
+  if (!test) {
+    return (
+      <div className="min-h-screen bg-secondary flex items-center justify-center">
+        <div className="text-destructive">Listening test not found</div>
+      </div>
+    );
+  }
+
+  // Show submission error state
+  if (submissionError) {
+    return (
+      <SubmissionErrorState
+        error={submissionError}
+        onResubmit={handleResubmit}
+        isResubmitting={isSubmitting}
+        testTopic={test.topic}
+        module="listening"
+      />
+    );
+  }
+
+  // Show start overlay before test begins
+  if (showStartOverlay) {
+    return (
+      <TestStartOverlay
+        module="listening"
+        testTitle={`AI Practice: ${test.questionType?.replace(/_/g, ' ') || 'Listening Test'}`}
+        timeMinutes={test.timeMinutes}
+        totalQuestions={test.totalQuestions}
+        questionType={test.questionType || 'Listening'}
+        difficulty={test.difficulty}
+        onStart={handleStartTest}
+        onCancel={() => navigate('/ai-practice')}
+      />
+    );
+  }
+
+  return (
+    <HighlightNoteProvider testId={testId!}>
+      <div className={cn("h-screen flex flex-col overflow-hidden", getThemeClasses(), "ielts-test-content")}>
+        {/* Offline Banner */}
+        <OfflineBanner hasPendingAnswers={Object.keys(answers).length > 0} />
+        <div className="flex-1 flex flex-col overflow-hidden">
+          {/* Top Header - IELTS Official Style with AI Practice badge */}
+          <header className="border-b px-2 md:px-4 py-1 md:py-3 flex items-center justify-between ielts-card ielts-header">
+            <div className="flex items-center gap-2 md:gap-4">
+              <button 
+                onClick={() => setShowExitDialog(true)}
+                className="p-2 rounded hover:bg-muted transition-colors"
+                title="Exit Test"
+              >
+                <ArrowLeft className="w-5 h-5" />
+              </button>
+              <ExitTestConfirmDialog
+                open={showExitDialog}
+                onOpenChange={setShowExitDialog}
+                onConfirm={() => navigate('/ai-practice')}
+                testType="Listening Test"
+              />
+              <div className="ielts-logo">
+                <span className="text-lg md:text-xl font-black tracking-tight text-[#c8102e]">IELTS</span>
+              </div>
+              <Badge variant="secondary" className="gap-1">
+                <Sparkles className="w-3 h-3" />
+                AI Practice
+              </Badge>
+              {/* Network Status Indicators */}
+              {!isOnline && (
+                <Badge variant="destructive" className="flex items-center gap-1 bg-red-500/90 animate-pulse">
+                  <WifiOff className="h-3 w-3" />
+                  <span className="text-xs">Offline</span>
+                </Badge>
+              )}
+              {usingDeviceAudio && (
+                <Badge variant="secondary" className="flex items-center gap-1 bg-amber-500/20 text-amber-600 dark:text-amber-400 border-amber-500/30">
+                  <Volume2 className="h-3 w-3" />
+                  <span className="text-xs">Device Audio</span>
+                </Badge>
+              )}
+              {audioEnded && (
+                <Badge variant="destructive" className="gap-1 animate-pulse">
+                  Review: {reviewTimeLeft}s
+                </Badge>
+              )}
+            </div>
+
+            {/* Audio Player in header */}
+            <div className="hidden md:flex flex-1 max-w-lg mx-4 items-center gap-3">
+              {audioError === 'tts_fallback' && test.transcript ? (
+                <SimulatedAudioPlayer
+                  text={test.transcript}
+                  onComplete={() => setAudioEnded(true)}
+                  className="flex-1"
+                />
+              ) : audioError ? (
+                <span className="text-sm text-destructive">{audioError}</span>
+              ) : (
+                <>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={togglePlayPause}
+                    disabled={!audioReady}
+                    className="gap-2"
+                  >
+                    {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+                    {isPlaying ? 'Pause' : 'Play'}
+                  </Button>
+                  <Progress value={audioProgress} className="flex-1" />
+                  
+                  {/* Playback Speed Control */}
+                  <select
+                    value={playbackSpeed}
+                    onChange={(e) => handleSpeedChange(parseFloat(e.target.value))}
+                    className="text-xs bg-muted border border-border rounded px-2 py-1 cursor-pointer"
+                    title="Playback Speed"
+                  >
+                    <option value={0.5}>0.5x</option>
+                    <option value={0.75}>0.75x</option>
+                    <option value={1}>1x</option>
+                    <option value={1.25}>1.25x</option>
+                    <option value={1.5}>1.5x</option>
+                  </select>
+                  
+                  <Volume2 className="w-4 h-4 text-muted-foreground" />
+                </>
+              )}
+            </div>
+
+            <div className="flex items-center gap-1 md:gap-3">
+              <ListeningTimer 
+                timeLeft={timeLeft} 
+                setTimeLeft={setTimeLeft} 
+                isPaused={!testStarted || isPaused}
+                onTogglePause={() => setIsPaused(!isPaused)}
+              />
+              <button 
+                className="p-2 rounded transition-colors ielts-icon-btn"
+                onClick={() => setIsNoteSidebarOpen(true)}
+                title="Notes"
+              >
+                <StickyNote className="w-5 h-5" />
+              </button>
+              <TestOptionsMenu
+                contrastMode={contrastMode}
+                setContrastMode={setContrastMode}
+                textSizeMode={textSizeMode}
+                setTextSizeMode={setTextSizeMode}
+                onSubmit={() => setShowSubmitDialog(true)}
+              />
+            </div>
+          </header>
+
+          {/* Topic/Difficulty Banner */}
+          <div className="bg-primary/5 border-b border-primary/20 px-4 py-2 flex items-center gap-2">
+            <span className="text-sm font-medium">{test.topic}</span>
+            <Badge variant="outline" className="text-xs capitalize">{test.difficulty}</Badge>
+            <Badge variant="secondary" className="text-xs">{test.questionType.replace(/_/g, ' ')}</Badge>
+          </div>
+
+          {/* Mobile Part/Questions Tabs */}
+          <div className="md:hidden flex border-b border-border bg-muted/40">
+            {partRanges.map((part, idx) => (
+              <button
+                key={part.label}
+                className={cn(
+                  "flex-1 py-1.5 text-xs font-medium text-center transition-colors",
+                  idx === activePartIndex && mobileView === 'questions'
+                    ? "bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:text-foreground hover:bg-muted/60"
+                )}
+                onClick={() => {
+                  setActivePartIndex(idx);
+                  setMobileView('questions');
+                  setCurrentQuestion(part.start);
+                }}
+              >
+                {part.label}
+              </button>
+            ))}
+            <button
+              className={cn(
+                "flex-1 py-1.5 text-xs font-medium text-center transition-colors",
+                mobileView === 'audio'
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:text-foreground hover:bg-muted/60"
+              )}
+              onClick={() => setMobileView('audio')}
+            >
+              Audio
+            </button>
+          </div>
+
+          {/* Part Header - IELTS Official Style */}
+          <div className="ielts-part-header hidden md:block">
+            <h2>{currentPart.label}</h2>
+            <p className="not-italic">Listen and answer questions {currentPart.start}–{currentPart.end}.</p>
+          </div>
+
+          {/* Main Content */}
+          <div className="flex-1 min-h-0 overflow-hidden">
+            {/* Desktop: Full questions view */}
+            <div className="hidden md:block h-full">
+              <ResizablePanelGroup direction="horizontal" className="h-full">
+                <ResizablePanel defaultSize={100} minSize={100} maxSize={100}>
+                  <div className="h-full flex flex-col relative">
+                    <div 
+                      className={cn(
+                        "flex-1 overflow-y-auto overflow-x-hidden p-6 pb-20 bg-white",
+                        "scrollbar-thin scrollbar-thumb-[hsl(0_0%_75%)] scrollbar-track-transparent",
+                        "font-[var(--font-ielts)] text-foreground"
+                      )}
+                    >
+                      {/* Audio player is in header only - no duplicate here */}
+
+                      <ListeningQuestions 
+                        testId={testId!}
+                        questions={questions.filter(q => q.question_number >= currentPart.start && q.question_number <= currentPart.end)}
+                        questionGroups={questionGroups.filter(g => g.start_question >= currentPart.start && g.end_question <= currentPart.end)}
+                        answers={answers}
+                        onAnswerChange={handleAnswerChange}
+                        currentQuestion={currentQuestion}
+                        setCurrentQuestion={setCurrentQuestion}
+                        fontSize={14}
+                        renderRichText={renderRichText}
+                      />
+                    </div>
+                    
+                    {/* Floating Navigation Arrows */}
+                    <div className="absolute bottom-2 right-4 flex items-center gap-2 z-10">
+                      <button 
+                        className={cn(
+                          "ielts-nav-arrow",
+                          currentQuestion === questions[0]?.question_number && "opacity-40 cursor-not-allowed"
+                        )}
+                        onClick={() => {
+                          const idx = questions.findIndex(q => q.question_number === currentQuestion);
+                          if (idx > 0) {
+                            setCurrentQuestion(questions[idx - 1].question_number);
+                          }
+                        }}
+                        disabled={currentQuestion === questions[0]?.question_number}
+                      >
+                        <ArrowLeft size={24} strokeWidth={2.5} />
+                      </button>
+                      <button 
+                        className="ielts-nav-arrow ielts-nav-arrow-primary"
+                        onClick={() => {
+                          const idx = questions.findIndex(q => q.question_number === currentQuestion);
+                          if (idx < questions.length - 1) {
+                            setCurrentQuestion(questions[idx + 1].question_number);
+                          }
+                        }}
+                      >
+                        <ArrowRight size={24} strokeWidth={2.5} />
+                      </button>
+                    </div>
+                  </div>
+                </ResizablePanel>
+              </ResizablePanelGroup>
+            </div>
+
+            {/* Mobile: Switch between Questions and Audio */}
+            <div className="md:hidden h-full flex flex-col relative">
+              {mobileView === 'questions' ? (
+                <div className="flex-1 overflow-y-auto overflow-x-hidden p-4 pb-20 bg-white font-[var(--font-ielts)] text-foreground">
+                  {/* Audio player accessible via Audio tab - no duplicate here */}
+
+                  <ListeningQuestions 
+                    testId={testId!}
+                    questions={questions.filter(q => q.question_number >= currentPart.start && q.question_number <= currentPart.end)}
+                    questionGroups={questionGroups.filter(g => g.start_question >= currentPart.start && g.end_question <= currentPart.end)}
+                    answers={answers}
+                    onAnswerChange={handleAnswerChange}
+                    currentQuestion={currentQuestion}
+                    setCurrentQuestion={setCurrentQuestion}
+                    fontSize={14}
+                    renderRichText={renderRichText}
+                  />
+                </div>
+              ) : (
+                <div className="flex-1 flex flex-col items-center justify-center p-4 bg-white">
+                  <p className="text-sm text-muted-foreground mb-4">Audio Player</p>
+                  {audioError === 'tts_fallback' && test.transcript ? (
+                    <div className="w-full max-w-md">
+                      <SimulatedAudioPlayer
+                        text={test.transcript}
+                        onComplete={() => setAudioEnded(true)}
+                      />
+                    </div>
+                  ) : audioError ? (
+                    <span className="text-sm text-destructive text-center">{audioError}</span>
+                  ) : (
+                    <div className="w-full max-w-md flex flex-col items-center gap-4">
+                      <Button
+                        variant="outline"
+                        size="lg"
+                        onClick={togglePlayPause}
+                        disabled={!audioReady}
+                        className="gap-2"
+                      >
+                        {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5" />}
+                        {isPlaying ? 'Pause' : 'Play Audio'}
+                      </Button>
+                      <Progress value={audioProgress} className="w-full" />
+                      
+                      {/* Mobile Speed Control */}
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs text-muted-foreground">Speed:</span>
+                        <select
+                          value={playbackSpeed}
+                          onChange={(e) => handleSpeedChange(parseFloat(e.target.value))}
+                          className="text-sm bg-muted border border-border rounded px-3 py-1.5 cursor-pointer"
+                        >
+                          <option value={0.5}>0.5x</option>
+                          <option value={0.75}>0.75x</option>
+                          <option value={1}>1x</option>
+                          <option value={1.25}>1.25x</option>
+                          <option value={1.5}>1.5x</option>
+                        </select>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Bottom Navigation - stays fixed */}
+        <ListeningNavigation
+          questions={questions}
+          answers={answers}
+          currentQuestion={currentQuestion}
+          setCurrentQuestion={setCurrentQuestion}
+          activePartIndex={activePartIndex}
+          onPartSelect={setActivePartIndex}
+          partRanges={partRanges}
+          flaggedQuestions={flaggedQuestions}
+          onSubmit={() => setShowSubmitDialog(true)}
+          questionGroups={questionGroups}
+        />
+      </div>
+      
+      {testId && (
+        <NoteSidebar 
+          testId={testId} 
+          isOpen={isNoteSidebarOpen} 
+          onOpenChange={setIsNoteSidebarOpen} 
+          renderRichText={renderRichText}
+        />
+      )}
+      
+      <SubmitConfirmDialog
+        open={showSubmitDialog}
+        onOpenChange={setShowSubmitDialog}
+        onConfirm={handleSubmit}
+        timeRemaining={timeLeft}
+        answeredCount={submitStats.answeredCount}
+        totalCount={submitStats.totalCount}
+        contrastMode={contrastMode}
+      />
+    </HighlightNoteProvider>
+  );
+}
