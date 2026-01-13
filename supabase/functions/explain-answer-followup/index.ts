@@ -35,7 +35,7 @@ async function decryptApiKey(encryptedValue: string, encryptionKey: string): Pro
 }
 
 // Gemini models to try (with fallback)
-const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+const GEMINI_MODELS = ['gemini-2.5-flash-preview-05-20'];
 
 async function callGemini(apiKey: string, prompt: string): Promise<string | null> {
   for (const model of GEMINI_MODELS) {

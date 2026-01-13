@@ -234,17 +234,10 @@ CRITICAL - VOICE-GENDER SYNCHRONIZATION:
   return constraint;
 }
 
-// Gemini models for IELTS text generation - sorted by performance & suitability
-// 1. gemini-2.5-flash: Stable, best speed/quality balance for structured text generation (June 2025)
-// 2. gemini-2.5-pro: Highest quality reasoning, best for complex question generation (fallback)
-// 3. gemini-2.0-flash: Fast & reliable, good general-purpose fallback
-// 4. gemini-2.0-flash-lite: Fastest, lightweight fallback for emergencies
-// EXCLUDED: TTS models, embedding models, image/video generation, experimental/preview, Gemma (smaller context)
+// Gemini models for IELTS text generation - using stable preview model
 const GEMINI_MODELS = [
-  'gemini-2.5-flash',      // Primary: best balance for IELTS generation
-  'gemini-2.5-pro',        // High quality fallback 
-  'gemini-2.0-flash',      // Fast reliable fallback
-  'gemini-2.0-flash-lite', // Emergency fallback (lower quality but fast)
+  'gemini-2.5-flash-preview-05-20',  // Primary: stable flash preview for IELTS generation
+  'gemini-2.5-pro-preview-05-06',    // High quality fallback
 ];
 
 // Store last error for better error messages
