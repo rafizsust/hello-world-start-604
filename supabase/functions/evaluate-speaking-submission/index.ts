@@ -28,11 +28,9 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-gemini-api-key',
 };
 
-// Model priority: 2.5 Flash -> 2.0 Flash -> 1.5 Pro
+// Model priority: 2.5 Flash only (2.0-flash deprecated, 1.5-pro removed from API)
 const GEMINI_MODELS = [
-  'gemini-2.5-flash',
-  'gemini-2.0-flash',
-  'gemini-1.5-pro',
+  'gemini-2.5-flash-preview-05-20',
 ];
 
 // Custom error class for quota exhaustion / rate limiting

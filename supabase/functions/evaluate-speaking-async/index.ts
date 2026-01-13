@@ -21,11 +21,9 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 };
 
-// Model priority: 2.5 Flash -> 2.0 Flash -> 1.5 Pro
+// Model priority: gemini-2.5-flash-preview-05-20 only (2.0-flash deprecated, 1.5-pro removed from API)
 const GEMINI_MODELS = [
-  'gemini-2.5-flash',
-  'gemini-2.0-flash',
-  'gemini-1.5-pro',
+  'gemini-2.5-flash-preview-05-20',
 ];
 
 // Retries are ONLY for transient transport errors.
